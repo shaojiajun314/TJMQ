@@ -1,10 +1,13 @@
 import asyncio
 from queue import Queue
-from threading import Thread
+from threading import Thread, Lock
 
 from .utils import readpkg
 from ..protocol import Protocol, Header, ProtocolError
 from ..abstract_client import AbstractClient, AuthError
+
+
+LOCK_INSTANCE = Lock()
 
 
 class Client(AbstractClient):
@@ -17,9 +20,10 @@ class Client(AbstractClient):
         self.data_cache = Queue()
         self.stop = False
         self.loop = None
+        self.read_task = None
         if not self.from_queue:
             self.net_queue_map = {}
-        Thread(target=self.run, daemon=True).start()
+        Thread(target=self.run).start()
 
     def push(self, queue, data):
         self.data_cache.put(Protocol.build_request(Header.PUSH, queue.encode(), data))
@@ -41,11 +45,12 @@ class Client(AbstractClient):
 
     async def client_write_loop(self):
         while 1:
-            if self.data_cache.empty():
-                if self.stop:
-                    return
-                await asyncio.sleep(0.05)
-                continue
+            with LOCK_INSTANCE:
+                if self.data_cache.empty():
+                    if self.stop:
+                        return
+                    await asyncio.sleep(0.05)
+                    continue
             d = self.data_cache.get()
             self.writer.write(f'{len(d)}\r\n'.encode())
             self.writer.write(d)
@@ -67,9 +72,11 @@ class Client(AbstractClient):
             self.net_queue_map[p.header.qname.decode()].put(p.body)
 
     async def client_loop(self):
+        write_task = self.client_write_loop()
+        self.read_task  = asyncio.create_task(self.client_read_loop())
         await asyncio.gather(
-            self.client_write_loop(),
-            self.client_read_loop()
+            write_task,
+            self.read_task
         )
 
     def run(self):
@@ -79,7 +86,10 @@ class Client(AbstractClient):
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(asyncio.new_event_loop())
         self.loop.run_until_complete(self.open_connection())
-        self.loop.run_until_complete(self.client_loop())
+        try:
+            self.loop.run_until_complete(self.client_loop())
+        except asyncio.exceptions.CancelledError:
+            pass
 
     def get_from_net(self, queue_name):
         if isinstance(queue_name, bytes):
@@ -91,7 +101,13 @@ class Client(AbstractClient):
         return self.net_queue_map[queue_name].get()
 
     def close(self):
-        self.stop = True
+        with LOCK_INSTANCE:
+            self.stop = True
+            if self.read_task:
+                # try:
+                self.read_task.cancel()
+                # except asyncio.exceptions.CancelledError:
+                #     pass
 
-    def __del__(self):
-        self.close()
+    # def __del__(self):
+    #     self.close()
